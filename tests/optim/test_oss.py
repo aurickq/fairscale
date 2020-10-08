@@ -14,10 +14,14 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import torch.nn.parallel.DistributedDataParallel as DDP
 
 import fairscale.optim as optim
 
 skip_if_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="cuda required")
+skip_if_not_enough_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 3, reason="not enought cuda devices"
+)
 
 BACKEND = dist.Backend.NCCL if torch.cuda.is_available() else dist.Backend.GLOO  # type: ignore
 DEVICE = "cuda" if torch.cuda.is_available() else torch.device("cpu")
@@ -355,7 +359,7 @@ def run_test_multiple_groups(rank, world_size):
     epochs, batch, input_width, hidden, target_width = 5, 3, 20, 10, 5
     loss_fn = torch.nn.L1Loss().to(device)
 
-    def check(optimizer):
+    def check(optimizer, model):
         # Just run a couple of epochs, check that the model is properly updated
         for _ in range(epochs):
             target = torch.rand((batch, target_width), device=device)
@@ -392,7 +396,7 @@ def run_test_multiple_groups(rank, world_size):
         optimizer = optim.OSS(
             model.parameters(), lr=0.1, momentum=0.99, group=process_group, broadcast_buffer_size=2 ** 20
         )
-        check(optimizer)
+        check(optimizer, model)
 
         # Model not-fitting in the broadcast bucket
         model = torch.nn.Sequential(torch.nn.Linear(input_width, hidden), torch.nn.Linear(hidden, target_width)).to(
@@ -401,7 +405,7 @@ def run_test_multiple_groups(rank, world_size):
 
         # With SGD, Momentum is required to get a state to shard
         optimizer = optim.OSS(model.parameters(), lr=0.1, momentum=0.99, group=process_group, broadcast_buffer_size=0)
-        check(optimizer)
+        check(optimizer, model)
 
 
 def test_multiple_groups():
@@ -409,4 +413,85 @@ def test_multiple_groups():
 
     mp.spawn(
         run_test_multiple_groups, args=(world_size,), nprocs=world_size, join=True,
+    )
+
+
+def run_test_ddp(rank, world_size):
+    # Only work with a subpart of the available ranks, to check that the global_rank indexing is properly used
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "29501"
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+    sub_group_ranks = list(range(1, world_size))
+    process_group = torch.distributed.new_group(ranks=sub_group_ranks, backend="nccl")
+
+    # Make sure that all the ranks get different training data
+    # So that the sync check in between their models is meaningful
+    torch.cuda.set_device(rank)
+    torch.cuda.manual_seed(0)
+    torch.manual_seed(rank)
+    np.random.seed(rank)
+
+    # Standard deep learning setup
+    device = torch.device(rank)
+    epochs, batch, input_width, hidden, target_width = 5, 3, 20, 10, 5
+    loss_fn = torch.nn.L1Loss().to(device)
+
+    def check(optimizer, model):
+        # Just run a couple of epochs, check that the model is properly updated
+        for _ in range(epochs):
+            target = torch.rand((batch, target_width), device=device)
+            inputs = torch.rand((batch, input_width), device=device)
+
+            def closure():
+                optimizer.zero_grad()
+                output = model(inputs)
+                loss = loss_fn(output, target)
+                loss /= world_size
+                loss.backward()
+                dist.all_reduce(loss, group=process_group)  # Not strictly needed for the test below
+
+                return loss
+
+            _ = optimizer.step(closure=closure)
+
+            # Check that all the params are the same on all ranks
+            for pg in optimizer.param_groups:
+                for p in pg["params"]:
+                    receptacle = [p.clone() for _ in sub_group_ranks] if rank == 0 else []
+                    dist.gather(p, receptacle, dst=0, group=process_group)
+                    if rank == 0:
+                        for sync_p in receptacle[1:]:
+                            assert torch.all(torch.eq(receptacle[0], sync_p)), "Models differ in between ranks"
+
+    if rank in sub_group_ranks:
+        # Model fitting in the broadcast bucket
+        model = torch.nn.Sequential(torch.nn.Linear(input_width, hidden), torch.nn.Linear(hidden, target_width)).to(
+            device
+        )
+        model = DDP(model, device_ids=[rank], process_group=process_group)
+
+        # With SGD, Momentum is required to get a state to shard
+        optimizer = optim.OSS(
+            model.parameters(), lr=0.1, momentum=0.99, group=process_group, broadcast_buffer_size=2 ** 20
+        )
+        check(optimizer)
+
+        # Model not-fitting in the broadcast bucket
+        model = torch.nn.Sequential(torch.nn.Linear(input_width, hidden), torch.nn.Linear(hidden, target_width)).to(
+            device
+        )
+        model = DDP(model, device_ids=[rank], process_group=process_group)
+
+        # With SGD, Momentum is required to get a state to shard
+        optimizer = optim.OSS(model.parameters(), lr=0.1, momentum=0.99, group=process_group, broadcast_buffer_size=0)
+        check(optimizer)
+
+
+@skip_if_not_enough_cuda
+def test_ddp():
+    world_size = torch.cuda.device_count()
+
+    mp.spawn(
+        run_test_ddp, args=(world_size,), nprocs=world_size, join=True,
     )
