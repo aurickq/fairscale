@@ -20,7 +20,7 @@ import fairscale.optim as optim
 
 skip_if_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="cuda required")
 skip_if_not_enough_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.device_count() < 3, reason="not enought cuda devices"
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason="not enought cuda devices"
 )
 
 BACKEND = dist.Backend.NCCL if torch.cuda.is_available() else dist.Backend.GLOO  # type: ignore
@@ -420,10 +420,7 @@ def run_test_ddp(rank, world_size):
     # Only work with a subpart of the available ranks, to check that the global_rank indexing is properly used
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29501"
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-
-    sub_group_ranks = list(range(1, world_size))
-    process_group = torch.distributed.new_group(ranks=sub_group_ranks, backend="nccl")
+    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
 
     # Make sure that all the ranks get different training data
     # So that the sync check in between their models is meaningful
@@ -449,7 +446,7 @@ def run_test_ddp(rank, world_size):
                 loss = loss_fn(output, target)
                 loss /= world_size
                 loss.backward()
-                dist.all_reduce(loss, group=process_group)  # Not strictly needed for the test below
+                dist.all_reduce(loss)  # Not strictly needed for the test below
 
                 return loss
 
@@ -458,34 +455,27 @@ def run_test_ddp(rank, world_size):
             # Check that all the params are the same on all ranks
             for pg in optimizer.param_groups:
                 for p in pg["params"]:
-                    receptacle = [p.clone() for _ in sub_group_ranks] if rank == 0 else []
-                    dist.gather(p, receptacle, dst=0, group=process_group)
+                    receptacle = [p.clone() for _ in range(world_size)] if rank == 0 else []
+                    dist.gather(p, receptacle, dst=0)
                     if rank == 0:
                         for sync_p in receptacle[1:]:
                             assert torch.all(torch.eq(receptacle[0], sync_p)), "Models differ in between ranks"
 
-    if rank in sub_group_ranks:
-        # Model fitting in the broadcast bucket
-        model = torch.nn.Sequential(torch.nn.Linear(input_width, hidden), torch.nn.Linear(hidden, target_width)).to(
-            device
-        )
-        model = DDP(model, device_ids=[rank], process_group=process_group)
+    # Model fitting in the broadcast bucket
+    model = torch.nn.Sequential(torch.nn.Linear(input_width, hidden), torch.nn.Linear(hidden, target_width)).to(device)
+    model = DDP(model, device_ids=[rank])
 
-        # With SGD, Momentum is required to get a state to shard
-        optimizer = optim.OSS(
-            model.parameters(), lr=0.1, momentum=0.99, group=process_group, broadcast_buffer_size=2 ** 20
-        )
-        check(optimizer)
+    # With SGD, Momentum is required to get a state to shard
+    optimizer = optim.OSS(model.parameters(), lr=0.1, momentum=0.99, group=None, broadcast_buffer_size=2 ** 20)
+    check(optimizer, model)
 
-        # Model not-fitting in the broadcast bucket
-        model = torch.nn.Sequential(torch.nn.Linear(input_width, hidden), torch.nn.Linear(hidden, target_width)).to(
-            device
-        )
-        model = DDP(model, device_ids=[rank], process_group=process_group)
+    # Model not-fitting in the broadcast bucket
+    model = torch.nn.Sequential(torch.nn.Linear(input_width, hidden), torch.nn.Linear(hidden, target_width)).to(device)
+    model = DDP(model, device_ids=[rank])
 
-        # With SGD, Momentum is required to get a state to shard
-        optimizer = optim.OSS(model.parameters(), lr=0.1, momentum=0.99, group=process_group, broadcast_buffer_size=0)
-        check(optimizer)
+    # With SGD, Momentum is required to get a state to shard
+    optimizer = optim.OSS(model.parameters(), lr=0.1, momentum=0.99, group=None, broadcast_buffer_size=0)
+    check(optimizer, model)
 
 
 @skip_if_not_enough_cuda
