@@ -14,7 +14,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import torch.nn.parallel.DistributedDataParallel as DDP
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 import fairscale.optim as optim
 
