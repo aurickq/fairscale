@@ -84,6 +84,10 @@ class ShardedDataParallel(nn.Module):
                 torch.zeros(buffer_size, dtype=buffer_dtype, device=device) for _ in range(len(per_device))
             ]
 
+        # - Sync the models in between the replicas
+        self._sync_parameters()
+        self._sync_buffers()
+
         # Sanity checks
         assert len(self.sharded_optimizer.param_to_rank) == len(
             list(self.module.parameters())
@@ -122,7 +126,7 @@ class ShardedDataParallel(nn.Module):
                 raise RuntimeError("OssDdp requires explicit reduction, must call OssDdp.reduce")
             if not self.accumulate_grads:
                 self.need_reduction = True
-            if self.broadcast_buffers and len(list(self.module.buffers())) > 0:
+            if self.broadcast_buffers:
                 self._sync_buffers()
 
         return self.module(*inputs, **kwargs)
@@ -232,6 +236,21 @@ class ShardedDataParallel(nn.Module):
                 map(
                     lambda x: dist.broadcast(x, self.authoritative_rank, self.process_group, async_op=True),
                     self.module.buffers(),
+                ),
+            )
+        )
+
+    def _sync_parameters(self) -> None:
+        """
+        Sync all the param buffers in between ranks.
+        TODO: Could be worth bucketing ?
+        """
+        _ = list(
+            map(
+                lambda x: x.wait(),
+                map(
+                    lambda x: dist.broadcast(x, self.authoritative_rank, self.process_group, async_op=True),
+                    self.module.parameters(),
                 ),
             )
         )
