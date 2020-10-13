@@ -204,53 +204,61 @@ class ShardedDataParallel(nn.Module):
                     raise RuntimeError("DistributedDataParallel only works with gradients that don't require grad")
 
                 p.grad.div_(world_size)  # type: ignore
-                requests.append(dist.reduce(tensor=p.grad, dst=global_rank, group=group, async_op=True))  # type: ignore
+                requests.append((dist.reduce(tensor=p.grad, dst=global_rank, group=group, async_op=True), rank, p))  # type: ignore
 
         # Unroll the initial packed small gradients, as soon as possible
         for future, rank in bucket_requests:
             future.wait()
 
-            if rank == self_rank:
-                i_bucketed = 0  # the number of tensors packed in the buffer
-                offset = 0
-                params = per_rank_params[rank]
-                buffer = buffers[rank]
+            i_bucketed = 0  # the number of tensors packed in the buffer
+            offset = 0
+            params = per_rank_params[rank]
+            buffer = buffers[rank]
 
-                while i_bucketed < len(params) and offset + params[i_bucketed].numel() < buffer_size:
-                    end = offset + params[i_bucketed].numel()
+            while i_bucketed < len(params) and offset + params[i_bucketed].numel() < buffer_size:
+                end = offset + params[i_bucketed].numel()
+
+                if rank == self_rank:
+                    # This rank is the owner, unpack the results in the appropriate parameters
                     params[i_bucketed].grad.data.copy_(buffer[offset:end].view_as(params[i_bucketed]))  # type: ignore
-                    offset = end
-                    i_bucketed += 1
+                else:
+                    # This rank is not the owner, these gradients have been reduced and can be released
+                    params[i_bucketed].grad = None
+
+                offset = end
+                i_bucketed += 1
 
         # Make sure that we're done with this device before moving on and cleaning the unused params
-        _ = list(map(lambda x: x.wait(), requests))
+        for future, rank, param in requests:
+            future.wait()
+            if rank == self_rank:
+                # This gradient has been reduced and this rank is not the owner, it can be released
+                param.grad = None
 
     def _sync_buffers(self) -> None:
         """
         Sync all the param buffers in between ranks.
         TODO: Could be worth bucketing ?
         """
-        _ = list(
+        requests = list(
             map(
-                lambda x: x.wait(),
-                map(
-                    lambda x: dist.broadcast(x, self.authoritative_rank, self.process_group, async_op=True),
-                    self.module.buffers(),
-                ),
-            )
+                lambda x: dist.broadcast(x, self.authoritative_rank, self.process_group, async_op=True),
+                self.module.buffers(),
+            ),
         )
+
+        _ = list(map(lambda x: x.wait(), requests))
 
     def _sync_parameters(self) -> None:
         """
-        Sync all the param buffers in between ranks.
+        Sync all the parameters in between ranks.
         TODO: Could be worth bucketing ?
         """
-        _ = list(
+        requests = list(
             map(
-                lambda x: x.wait(),
-                map(
-                    lambda x: dist.broadcast(x, self.authoritative_rank, self.process_group, async_op=True),
-                    self.module.parameters(),
-                ),
-            )
+                lambda x: dist.broadcast(x, self.authoritative_rank, self.process_group, async_op=True),
+                self.module.parameters(),
+            ),
         )
+
+        _ = list(map(lambda x: x.wait(), requests))
