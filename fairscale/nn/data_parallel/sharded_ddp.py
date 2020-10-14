@@ -160,7 +160,8 @@ class ShardedDataParallel(nn.Module):
         """Helper to reduce a list of params. The params are sorted by size, smallest first, which allows for
         an opportunistic bucketing.
 
-        NOTE: All param gradients are assumed to exist"""
+        .. warning: All param gradients are assumed to exist
+        .. warning: Reduced grads are removed from the ranks which don't own them, to save memory """
 
         buffer_size = buffers[0].numel()
         bucket_requests = []
@@ -186,6 +187,11 @@ class ShardedDataParallel(nn.Module):
                 end = offset + params[i_bucketed].numel()
                 buffer[offset:end].copy_(params[i_bucketed].grad.data.view(-1))  # type: ignore
                 offset = end
+
+                if rank != self_rank:
+                    # This rank is not the owner, these gradients have been reduced and can be released
+                    params[i_bucketed].grad = None
+
                 i_bucketed += 1
 
             if i_bucketed > 0:
@@ -210,28 +216,23 @@ class ShardedDataParallel(nn.Module):
         for future, rank in bucket_requests:
             future.wait()
 
-            i_bucketed = 0  # the number of tensors packed in the buffer
-            offset = 0
-            params = per_rank_params[rank]
-            buffer = buffers[rank]
+            if rank == self_rank:
+                # This rank is the owner, unpack the results in the appropriate parameters
+                i_bucketed = 0  # the number of tensors packed in the buffer
+                offset = 0
+                params = per_rank_params[rank]
+                buffer = buffers[rank]
 
-            while i_bucketed < len(params) and offset + params[i_bucketed].numel() < buffer_size:
-                end = offset + params[i_bucketed].numel()
-
-                if rank == self_rank:
-                    # This rank is the owner, unpack the results in the appropriate parameters
+                while i_bucketed < len(params) and offset + params[i_bucketed].numel() < buffer_size:
+                    end = offset + params[i_bucketed].numel()
                     params[i_bucketed].grad.data.copy_(buffer[offset:end].view_as(params[i_bucketed]))  # type: ignore
-                else:
-                    # This rank is not the owner, these gradients have been reduced and can be released
-                    params[i_bucketed].grad = None
-
-                offset = end
-                i_bucketed += 1
+                    offset = end
+                    i_bucketed += 1
 
         # Make sure that we're done with this device before moving on and cleaning the unused params
         for future, rank, param in requests:
             future.wait()
-            if rank == self_rank:
+            if rank != self_rank:
                 # This gradient has been reduced and this rank is not the owner, it can be released
                 param.grad = None
 

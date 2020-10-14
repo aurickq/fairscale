@@ -97,7 +97,6 @@ def train(
             world_size=world_size,
             broadcast_buffers=True,
         )
-        ddp.train()
         optimizer = ddp.optimizer
         model = ddp
     else:
