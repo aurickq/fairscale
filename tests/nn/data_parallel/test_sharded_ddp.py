@@ -66,6 +66,10 @@ def run_one_step(rank, world_size, backend, device, temp_file_name):
                     for sync_p in receptacle[1:]:
                         assert torch.all(torch.eq(receptacle[0], sync_p)), "Models differ in between ranks"
 
+        # Check that all the buffers are in sync (authoritative rank is 0, its buffer is 0)
+        for b in model.buffers():
+            assert b.cpu().item() == 0.0
+
     # The model should be synchronized in between the ranks at ShardedDataParallel construction time, check that
     check_same_model_params()
 
@@ -82,10 +86,6 @@ def run_one_step(rank, world_size, backend, device, temp_file_name):
             assert optimizer.optim.param_groups[0]["params"][0].grad.sum().item() == 0.0
 
         ddp.reduce()
-
-        # Check that all the buffers are in sync (authoritative rank is 0, its buffer is 0)
-        for b in model.buffers():
-            assert b.cpu().item() == 0.0
 
         return loss
 
