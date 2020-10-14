@@ -38,13 +38,13 @@ def run_one_step(rank, world_size, backend, device, temp_file_name):
         torch.cuda.set_device(rank)
 
     # Any model works. Add one different buffer per rank
-    model = Sequential(Linear(2, 3)).to(device)
+    model = Sequential(Linear(2, 3), Linear(3, 4)).to(device)
     model.register_buffer("test_buffer", torch.ones((1)) * rank)
 
     def weights_init(m):
         if isinstance(m, Linear):
             torch.nn.init.constant_(m.weight.data, 1.0)
-            torch.nn.init.constant_(m.bias.data, 1.0)
+            torch.nn.init.constant_(m.bias.data, 0.0)
 
     model.apply(weights_init)
     model.to(device)
@@ -60,18 +60,27 @@ def run_one_step(rank, world_size, backend, device, temp_file_name):
     model = ddp.module
 
     # Different input per rank, allows for checking that the gradients have been properly reduced
-    input_tensor = (torch.ones((64, 2)) * rank).to(device)
+    input_tensor = torch.zeros((64, 2)).to(device) if rank == 0 else torch.ones((64, 2)).to(device)
+
     output = ddp(input_tensor).abs().sum()
     output.backward()
+
+    if rank == 0:
+        assert optimizer.optim.param_groups[0]["params"][0].grad.sum().item() == 0.0
+
     ddp.reduce()
 
-    # Check that all the grads have been populated, for the shard
+    # Check that the grads have been correctly reduced
+    # NOTE: We know that the average in this case is val * (world_size -1)/world_size
+    # because only the first rank has a null gradient, the other ones have the same
+    avg = float(world_size - 1) / world_size
+
     for pg in optimizer.optim.param_groups:
         for param in pg["params"]:
             if param.shape == torch.Size([3, 2]):
-                assert param.grad[0, 0].cpu() == torch.tensor([32.0])
+                assert param.grad[0, 0].item() == 128.0
             if param.shape == torch.Size([3]):
-                assert param.grad[0].cpu() == torch.tensor([64.0])
+                assert param.grad[0].item() == 128.0
 
     # Check that all the buffers are in sync (authoritative rank is 0, its buffer is 0)
     for b in model.buffers():

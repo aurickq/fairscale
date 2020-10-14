@@ -143,15 +143,14 @@ class ShardedDataParallel(nn.Module):
 
         self.need_reduction = False
 
-        with torch.no_grad():
-            for device, per_device in self.sharded_optimizer.per_device_params.items():
-                self._reduce_grads_task(
-                    self._reduce_buffers[device],
-                    per_device,
-                    group=self.process_group,
-                    self_rank=self.rank,
-                    world_size=self.world_size,
-                )
+        for device, per_device in self.sharded_optimizer.per_device_params.items():
+            self._reduce_grads_task(
+                self._reduce_buffers[device],
+                per_device,
+                group=self.process_group,
+                self_rank=self.rank,
+                world_size=self.world_size,
+            )
 
     @staticmethod
     def _reduce_grads_task(
