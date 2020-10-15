@@ -58,13 +58,14 @@ def run_one_step(rank, world_size, backend, device, temp_file_name):
 
     def check_same_model_params():
         # Check that all the params are the same on all ranks
-        for pg in optimizer.param_groups:
-            for p in pg["params"]:
-                receptacle = [p.clone() for _ in range(world_size)] if rank == 0 else []
-                dist.gather(p, receptacle, dst=0)
-                if rank == 0:
-                    for sync_p in receptacle[1:]:
-                        assert torch.all(torch.eq(receptacle[0], sync_p)), "Models differ in between ranks"
+        if dist.get_backend() != "nccl":
+            for pg in optimizer.param_groups:
+                for p in pg["params"]:
+                    receptacle = [p.clone() for _ in range(world_size)] if rank == 0 else []
+                    dist.gather(p, receptacle, dst=0)
+                    if rank == 0:
+                        for sync_p in receptacle[1:]:
+                            assert torch.all(torch.eq(receptacle[0], sync_p)), "Models differ in between ranks"
 
         # Check that all the buffers are in sync (authoritative rank is 0, its buffer is 0)
         for b in model.buffers():
