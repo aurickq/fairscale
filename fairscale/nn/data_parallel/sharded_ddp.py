@@ -126,12 +126,13 @@ class ShardedDataParallel(nn.Module):
                 raise RuntimeError("OssDdp requires explicit reduction, must call OssDdp.reduce")
             if not self.accumulate_grads:
                 self.need_reduction = True
-            if self.broadcast_buffers:
-                self._sync_buffers()
+
+        if self.broadcast_buffers:
+            self._sync_buffers()
 
         return self.module(*inputs, **kwargs)
 
-    def reduce(self) -> None:
+    def reduce(self, free_temporary_grads: bool = True) -> None:
         """
         This function must be called explicitly after backward to reduce
         gradients. There is no automatic hook like c10d.
@@ -150,32 +151,40 @@ class ShardedDataParallel(nn.Module):
                 group=self.process_group,
                 self_rank=self.rank,
                 world_size=self.world_size,
+                free_temporary_grads=free_temporary_grads,
             )
 
     @staticmethod
     def _reduce_grads_task(
-        buffers: List[torch.Tensor], per_rank_params: List[List[Parameter]], group: Any, self_rank: int, world_size: int
+        buffers: List[torch.Tensor],
+        per_rank_params: List[List[Parameter]],
+        group: Any,
+        self_rank: int,
+        world_size: int,
+        free_temporary_grads: bool,
     ) -> None:
         """Helper to reduce a list of params. The params are sorted by size, smallest first, which allows for
         an opportunistic bucketing.
 
         .. warning: All param gradients are assumed to exist
-        .. warning: Reduced grads are removed from the ranks which don't own them, to save memory """
+        .. warning: Reduced grads are removed from the ranks which don't own them, to save memory"""
 
         buffer_size = buffers[0].numel()
         bucket_requests = []
-        requests = []
+        direct_requests: List[Any] = []
 
-        for (rank, params), buffer in zip(enumerate(per_rank_params), buffers):
+        # First issue all the reduce requests, for all devices, and collect the pseudo-futures. Two parts:
+        #  - the smallest gradients are bucketed
+        #  - the biggest are reduced directly
+        for (dst_rank, params), buffer in zip(enumerate(per_rank_params), buffers):
             # All the params are sorted per rank and per increasing size
             if len(params) == 0:
                 continue
 
-            for p in params:
-                if p.grad is None:
-                    p.grad = torch.zeros_like(p)
+            for p in filter(lambda x: x.grad is None, params):
+                p.grad = torch.zeros_like(p)
 
-            global_rank = OSS.get_global_rank(group, rank)
+            global_rank = OSS.get_global_rank(group, dst_rank)
 
             # Copy small gradients into per-GPU buffers and then async reduce
             i_bucketed = 0  # the number of tensors packed in the buffer
@@ -187,7 +196,7 @@ class ShardedDataParallel(nn.Module):
                 buffer[offset:end].copy_(params[i_bucketed].grad.data.view(-1))  # type: ignore
                 offset = end
 
-                if rank != self_rank:
+                if free_temporary_grads and dst_rank != self_rank:
                     # This rank is not the owner, these gradients have been reduced and can be released
                     params[i_bucketed].grad = None
 
@@ -198,7 +207,7 @@ class ShardedDataParallel(nn.Module):
                 bucket_requests.append(
                     (
                         dist.reduce(tensor=buffer, dst=global_rank, group=group, async_op=True),  # type: ignore
-                        rank,
+                        dst_rank,
                     )
                 )
 
@@ -209,18 +218,18 @@ class ShardedDataParallel(nn.Module):
                     raise RuntimeError("DistributedDataParallel only works with gradients that don't require grad")
 
                 p.grad.div_(world_size)  # type: ignore
-                requests.append((dist.reduce(tensor=p.grad, dst=global_rank, group=group, async_op=True), rank, p))  # type: ignore
+                direct_requests.append((dist.reduce(tensor=p.grad, dst=global_rank, group=group, async_op=True), dst_rank, p))  # type: ignore
 
-        # Unroll the initial packed small gradients, as soon as possible
-        for future, rank in bucket_requests:
-            future.wait()
+        # Now unroll the initial packed small gradients, as soon as possible
+        for work_handle, dst_rank in bucket_requests:
+            work_handle.wait()
 
-            if rank == self_rank:
+            if dst_rank == self_rank:
                 # This rank is the owner, unpack the results in the appropriate parameters
                 i_bucketed = 0  # the number of tensors packed in the buffer
                 offset = 0
-                params = per_rank_params[rank]
-                buffer = buffers[rank]
+                params = per_rank_params[dst_rank]
+                buffer = buffers[dst_rank]
 
                 while i_bucketed < len(params) and offset + params[i_bucketed].numel() < buffer_size:
                     end = offset + params[i_bucketed].numel()
@@ -228,10 +237,10 @@ class ShardedDataParallel(nn.Module):
                     offset = end
                     i_bucketed += 1
 
-        # Make sure that we're done with this device before moving on and cleaning the unused params
-        for future, rank, param in requests:
-            future.wait()
-            if rank != self_rank:
+        # Finally, make sure that we're done with this device before moving on and cleaning the unused params
+        for work_handle, dst_rank, param in direct_requests:
+            work_handle.wait()
+            if free_temporary_grads and dst_rank != self_rank:
                 # This gradient has been reduced and this rank is not the owner, it can be released
                 param.grad = None
 

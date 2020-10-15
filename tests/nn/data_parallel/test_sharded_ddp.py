@@ -23,7 +23,7 @@ skip_if_single_gpu = pytest.mark.skipif(torch.cuda.device_count() < 2, reason="m
 
 
 def test_on_cpu():
-    run_test(backend=dist.Backend.GLOO, device=torch.device("cpu"), world_size=4)
+    run_test(backend=dist.Backend.GLOO, device=torch.device("cpu"), world_size=10)
 
 
 @skip_if_no_cuda
@@ -42,7 +42,7 @@ def run_one_step(rank, world_size, backend, device, temp_file_name):
     np.random.seed(rank)
 
     # Any model works. Add one different buffer per rank
-    model = Sequential(Linear(2, 3), Linear(3, 4)).to(device)
+    model = Sequential(Linear(2, 3), Linear(3, 3), Linear(3, 3), Linear(3, 3), Linear(3, 3)).to(device)
     model.register_buffer("test_buffer", torch.ones((1)) * rank)
     model.to(device)
 
@@ -61,6 +61,7 @@ def run_one_step(rank, world_size, backend, device, temp_file_name):
         if dist.get_backend() != "nccl":
             for pg in optimizer.param_groups:
                 for p in pg["params"]:
+                    # Check the params
                     receptacle = [p.clone() for _ in range(world_size)] if rank == 0 else []
                     dist.gather(p, receptacle, dst=0)
                     if rank == 0:
@@ -77,22 +78,44 @@ def run_one_step(rank, world_size, backend, device, temp_file_name):
     # Optim loop
     def closure():
         optimizer.zero_grad()
-        # Different input per rank, allows for checking that the gradients have been properly reduced
-        input_tensor = torch.zeros((64, 2)).to(device) if rank == 0 else torch.ones((64, 2)).to(device)
 
+        input_tensor = torch.ones((64, 2)).to(device)
         loss = ddp(input_tensor).abs().sum()
         loss.backward()
 
+        # Nuke all the grads for the first rank, to check the reduction
         if rank == 0:
-            assert optimizer.optim.param_groups[0]["params"][0].grad.sum().item() == 0.0
+            for pg in optimizer.param_groups:
+                for p in pg["params"]:
+                    p.grad.fill_(0.0)
 
-        ddp.reduce()
+        ddp.reduce(free_temporary_grads=False)  # Keep all grads up to check the reduction
+
+        # Check that the grads have been properly reduced
+        if dist.get_backend() != "nccl":
+            for pg in optimizer.param_groups:
+                for p in pg["params"]:
+                    owner = optimizer.param_to_rank[p]
+                    is_owner = rank == owner
+
+                    # The grad was initially 0 on rank 0, and something for all other ranks
+                    # Check that after reduction, the owner has the correct value
+                    receptacle = [p.grad.clone() for _ in range(world_size)] if is_owner else []
+                    dist.gather(p.grad, receptacle, dst=owner)
+
+                    if is_owner:
+                        # The recipient grad have been modified in place, so the current value cannot be an input
+                        reference = rank + 1 if rank < world_size - 1 else 1
+                        ref_value = receptacle[reference] * (world_size - 1) / world_size
+                        valid = torch.all(torch.isclose(p.grad, ref_value))
+                        assert valid, "Rank {}: Gradient reduction failed : \n{} \nvs \n{} \n ** \n{}".format(
+                            rank, p.grad, ref_value, torch.isclose(p.grad, ref_value)
+                        )
 
         return loss
 
-    # The raw gradients are different in between the ranks, check that they are properly reduced
-    # the models should stay the same in between the ranks
-    for i in range(10):
+    # The models should stay the same in between the ranks
+    for i in range(5):
         _ = optimizer.step(closure=closure)
         check_same_model_params()
 
